@@ -1,9 +1,11 @@
 """Email Payment Monitor — checks IMAP inbox for payment emails and notifies Discord."""
 
 import io
+import json
 import logging
 import os
 import re
+import signal
 import sys
 import time
 from datetime import date, timedelta
@@ -33,6 +35,20 @@ DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
 wise_account_number = os.getenv("WISE_ACCOUNT_NUMBER", "")
+
+# --- Graceful shutdown ---
+shutdown = False
+
+
+def handle_signal(sig, frame):
+    """Handle termination signals for graceful shutdown."""
+    global shutdown
+    logger.info("Shutdown signal received (sig=%s), finishing current cycle...", sig)
+    shutdown = True
+
+
+signal.signal(signal.SIGINT, handle_signal)
+signal.signal(signal.SIGTERM, handle_signal)
 
 
 def get_accounts() -> list[dict]:
@@ -69,6 +85,53 @@ AMOUNT_RE = re.compile(r"([\d,]+\.?\d*)")
 CURRENCY_RE = re.compile(r"(\$|€|£|¥|USD|EUR|GBP|JPY|BTC|ETH|USDT|USDC)", re.IGNORECASE)
 
 
+class AccountConnection:
+    """Manages a persistent IMAP connection for one email account."""
+
+    def __init__(self, account: dict):
+        self.account = account
+        self.mailbox: MailBox | None = None
+
+    @property
+    def email(self) -> str:
+        return self.account["email"]
+
+    @property
+    def server(self) -> str:
+        return self.account["server"]
+
+    def connect(self) -> MailBox:
+        """Return existing connection or create a new one. Auto-reconnects on failure."""
+        if self.mailbox is not None:
+            try:
+                self.mailbox.client.noop()  # health check
+                return self.mailbox
+            except Exception:
+                logger.warning("Connection stale for %s, reconnecting...", self.email)
+                self._close()
+
+        logger.info("Connecting to %s as %s ...", self.server, self.email)
+        self.mailbox = MailBox(self.server).login(
+            self.account["email"], self.account["password"]
+        )
+        logger.info("Login successful for %s", self.email)
+        return self.mailbox
+
+    def _close(self):
+        """Safely close the IMAP connection."""
+        try:
+            if self.mailbox:
+                self.mailbox.logout()
+        except Exception:
+            pass
+        self.mailbox = None
+
+    def close(self):
+        """Public close method for clean shutdown."""
+        self._close()
+        logger.debug("Connection closed for %s", self.email)
+
+
 def validate_config() -> bool:
     """Validate required configuration. Returns True if valid."""
     valid = True
@@ -94,16 +157,21 @@ def detect_provider(sender: str, subject: str, body: str) -> str | None:
     sender_lower = sender.lower()
     subject_lower = subject.lower()
 
-    # PayPal: sender contains "paypal" AND subject indicates received payment
-    if "paypal" in sender_lower:
+    # PayPal: sender contains "paypal" AND subject indicates a payment
+    if "paypal" in sender_lower and any(
+        kw in subject_lower
+        for kw in ["received", "payment", "sent you", "diterima", "pembayaran"]
+    ):
         return "PayPal"
 
-    # Wise: sender contains "wise" AND subject indicates received money
-    if "jago" in sender_lower and wise_account_number in body:
+    # Bank Jago (Wise transfer destination): sender is Jago AND body contains the account number
+    if "jago" in sender_lower and wise_account_number and wise_account_number in body:
         return "Wise"
 
-    # Crypto: subject contains deposit + confirmed
-    if "binance" in subject_lower:
+    # Crypto: Binance deposit/transfer notifications
+    if "binance" in sender_lower and any(
+        kw in subject_lower for kw in ["deposit", "transfer", "received", "confirmed"]
+    ):
         return "Crypto"
 
     return None
@@ -195,7 +263,7 @@ def send_discord_notification(payment: dict, html_body: str = "") -> None:
                 "file": ("email.png", io.BytesIO(image_bytes), "image/png"),
                 "payload_json": (
                     None,
-                    __import__("json").dumps(payload),
+                    json.dumps(payload),
                     "application/json",
                 ),
             }
@@ -222,78 +290,15 @@ def send_discord_notification(payment: dict, html_body: str = "") -> None:
         logger.error("Discord webhook request failed: %s", e)
 
 
-def check_emails(account: dict) -> None:
-    """Connect to IMAP, check UNSEEN emails, detect payments, and notify."""
-    email_address = account["email"]
-    email_password = account["password"]
-    imap_server = account["server"]
-
-    logger.info("Connecting to %s as %s ...", imap_server, email_address)
-
+def check_emails(conn: AccountConnection) -> None:
+    """Check UNSEEN emails via persistent connection, detect payments, and notify."""
     try:
-        with MailBox(imap_server).login(email_address, email_password) as mailbox:
-            logger.info("Login successful for %s", email_address)
-            since_date = date.today() - timedelta(days=7)
-            logger.debug("Fetching UNSEEN emails since %s...", since_date)
-
-            count = 0
-            detected = 0
-            for msg in mailbox.fetch(AND(seen=False, date_gte=since_date)):
-                count += 1
-                sender = msg.from_ or ""
-                subject = msg.subject or ""
-                body = msg.text or msg.html or ""
-                html_body = msg.html or ""
-                message_id = (
-                    msg.headers.get("message-id", [""])[0] if msg.headers else ""
-                )
-
-                logger.debug(
-                    "Email #%d: from=%s subject='%s' id=%s",
-                    count,
-                    sender,
-                    subject[:60],
-                    message_id[:40],
-                )
-
-                if not message_id:
-                    logger.warning(
-                        "Skipping email with no message-id: subject='%s'", subject
-                    )
-                    continue
-
-                if is_processed(message_id):
-                    logger.debug("Already processed, skipping: %s", message_id[:40])
-                    continue
-
-                provider = detect_provider(sender, subject, body)
-                if provider is None:
-                    logger.debug(
-                        "Not a payment email, skipping: subject='%s'", subject[:60]
-                    )
-                    continue
-
-                detected += 1
-                logger.info(
-                    "DETECTED %s payment from %s — subject='%s'",
-                    provider,
-                    sender,
-                    subject,
-                )
-                payment = parse_payment(sender, subject, body, message_id, provider)
-                send_discord_notification(payment, html_body)
-                mark_processed(message_id)
-                logger.info("Marked as processed: %s", message_id[:40])
-
-            logger.info(
-                "Done — %d email(s) checked, %d payment(s) detected", count, detected
-            )
-
+        mailbox = conn.connect()
     except MailboxLoginError as e:
         logger.error(
             "IMAP login failed for %s on %s — %s",
-            email_address,
-            imap_server,
+            conn.email,
+            conn.server,
             e,
         )
         logger.error(
@@ -301,23 +306,106 @@ def check_emails(account: dict) -> None:
             "Go to https://myaccount.google.com/apppasswords to generate one. "
             "Regular passwords won't work if you have 2FA enabled."
         )
+        return
     except ConnectionRefusedError:
         logger.error(
             "Connection refused by %s — is the IMAP server address correct?",
-            imap_server,
+            conn.server,
         )
+        return
     except TimeoutError:
         logger.error(
-            "Connection to %s timed out — check your network or firewall", imap_server
+            "Connection to %s timed out — check your network or firewall", conn.server
         )
+        return
     except OSError as e:
-        logger.error("Network error connecting to %s: %s", imap_server, e)
+        logger.error("Network error connecting to %s: %s", conn.server, e)
+        return
     except Exception as e:
-        logger.error("Unexpected error: %s: %s", type(e).__name__, e, exc_info=True)
+        logger.error("Unexpected error connecting to %s: %s: %s", conn.server, type(e).__name__, e, exc_info=True)
+        return
+
+    try:
+        since_date = date.today() - timedelta(days=7)
+        logger.debug("Fetching UNSEEN emails since %s for %s...", since_date, conn.email)
+
+        count = 0
+        detected = 0
+        for msg in mailbox.fetch(AND(seen=False, date_gte=since_date), mark_seen=False):
+            count += 1
+            sender = msg.from_ or ""
+            subject = msg.subject or ""
+            body = msg.text or msg.html or ""
+            html_body = msg.html or ""
+            message_id = (
+                msg.headers.get("message-id", [""])[0] if msg.headers else ""
+            )
+
+            logger.debug(
+                "Email #%d: from=%s subject='%s' id=%s",
+                count,
+                sender,
+                subject[:60],
+                message_id[:40],
+            )
+
+            if not message_id:
+                logger.warning(
+                    "Skipping email with no message-id: subject='%s'", subject
+                )
+                continue
+
+            if is_processed(message_id):
+                logger.debug("Already processed, skipping: %s", message_id[:40])
+                continue
+
+            provider = detect_provider(sender, subject, body)
+            if provider is None:
+                logger.debug(
+                    "Not a payment email, skipping: subject='%s'", subject[:60]
+                )
+                continue
+
+            detected += 1
+            logger.info(
+                "DETECTED %s payment from %s — subject='%s'",
+                provider,
+                sender,
+                subject,
+            )
+            payment = parse_payment(sender, subject, body, message_id, provider)
+            send_discord_notification(payment, html_body)
+            mark_processed(message_id)
+
+            # Mark as seen on the server only after successful processing
+            try:
+                mailbox.seen(msg.uid)
+            except Exception as e:
+                logger.warning("Failed to mark email as seen (uid=%s): %s", msg.uid, e)
+
+            logger.info("Marked as processed: %s", message_id[:40])
+
+        logger.info(
+            "Done — %d email(s) checked, %d payment(s) detected for %s",
+            count,
+            detected,
+            conn.email,
+        )
+
+    except Exception as e:
+        logger.error(
+            "Error fetching emails for %s: %s: %s",
+            conn.email,
+            type(e).__name__,
+            e,
+            exc_info=True,
+        )
+        # Force reconnect on next cycle
+        conn._close()
 
 
 def main() -> None:
-    """Main worker loop."""
+    """Main worker loop with persistent connections and graceful shutdown."""
     logger.info("=" * 50)
     logger.info("  Email Payment Monitor")
     logger.info("=" * 50)
@@ -334,13 +422,25 @@ def main() -> None:
         logger.critical("Configuration invalid — fix your .env file and restart")
         sys.exit(1)
 
+    # Create persistent connections (loaded once, not every loop)
+    connections = [AccountConnection(acc) for acc in accounts]
+
     logger.info("Starting email monitor loop...")
 
-    while True:
-        for account in get_accounts():
-            check_emails(account)
-        logger.info("Sleeping %ds until next check...", POLL_INTERVAL)
-        time.sleep(POLL_INTERVAL)
+    try:
+        while not shutdown:
+            for conn in connections:
+                if shutdown:
+                    break
+                check_emails(conn)
+            if not shutdown:
+                logger.info("Sleeping %ds until next check...", POLL_INTERVAL)
+                time.sleep(POLL_INTERVAL)
+    finally:
+        logger.info("Shutting down — closing all connections...")
+        for conn in connections:
+            conn.close()
+        logger.info("All connections closed. Goodbye!")
 
 
 if __name__ == "__main__":

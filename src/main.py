@@ -29,13 +29,38 @@ logging.basicConfig(
 logger = logging.getLogger("email-monitor")
 
 # --- Config ---
-EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
-IMAP_SERVER = os.getenv("IMAP_SERVER", "imap.gmail.com")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
 wise_account_number = os.getenv("WISE_ACCOUNT_NUMBER", "")
+
+
+def get_accounts() -> list[dict]:
+    """Retrieve list of email accounts from environment variables."""
+    accounts = []
+
+    # Primary
+    primary_email = os.getenv("EMAIL_ADDRESS", "")
+    primary_pass = os.getenv("EMAIL_PASSWORD", "")
+    if primary_email and primary_pass:
+        accounts.append(
+            {
+                "email": primary_email,
+                "password": primary_pass,
+                "server": os.getenv("IMAP_SERVER", "imap.gmail.com"),
+            }
+        )
+
+    # Additional
+    for i in range(2, 20):
+        email = os.getenv(f"EMAIL_ADDRESS_{i}", "")
+        password = os.getenv(f"EMAIL_PASSWORD_{i}", "")
+        server = os.getenv(f"IMAP_SERVER_{i}", "imap.gmail.com")
+        if email and password:
+            accounts.append({"email": email, "password": password, "server": server})
+
+    return accounts
+
 
 # --- Amount regex: matches numbers like 1,234.56 or 100 or 0.99 ---
 AMOUNT_RE = re.compile(r"([\d,]+\.?\d*)")
@@ -47,15 +72,13 @@ CURRENCY_RE = re.compile(r"(\$|€|£|¥|USD|EUR|GBP|JPY|BTC|ETH|USDT|USDC)", re
 def validate_config() -> bool:
     """Validate required configuration. Returns True if valid."""
     valid = True
-    if not EMAIL_ADDRESS:
-        logger.error("EMAIL_ADDRESS is not set in .env")
+    accounts = get_accounts()
+    if not accounts:
+        logger.error(
+            "No valid email accounts configured in .env (need at least EMAIL_ADDRESS and EMAIL_PASSWORD)"
+        )
         valid = False
-    if not EMAIL_PASSWORD:
-        logger.error("EMAIL_PASSWORD is not set in .env")
-        valid = False
-    if not IMAP_SERVER:
-        logger.error("IMAP_SERVER is not set in .env")
-        valid = False
+
     if not DISCORD_WEBHOOK and not DRY_RUN:
         logger.warning(
             "DISCORD_WEBHOOK is not set — notifications will fail (use DRY_RUN=true to test)"
@@ -145,9 +168,7 @@ def html_to_image(html_body: str) -> bytes | None:
 def send_discord_notification(payment: dict, html_body: str = "") -> None:
     """Send payment notification to Discord webhook with email screenshot."""
     message = (
-        "💰 **PAYMENT RECEIVED**\n\n"
-        f"**Provider:** {payment['provider']}\n"
-        f"**From:** {payment['sender']}\n"
+        f"💰 **Email From {payment['provider']}**\n\n"
         f"**Subject:** {payment['subject']}"
     )
 
@@ -201,13 +222,17 @@ def send_discord_notification(payment: dict, html_body: str = "") -> None:
         logger.error("Discord webhook request failed: %s", e)
 
 
-def check_emails() -> None:
+def check_emails(account: dict) -> None:
     """Connect to IMAP, check UNSEEN emails, detect payments, and notify."""
-    logger.info("Connecting to %s as %s ...", IMAP_SERVER, EMAIL_ADDRESS)
+    email_address = account["email"]
+    email_password = account["password"]
+    imap_server = account["server"]
+
+    logger.info("Connecting to %s as %s ...", imap_server, email_address)
 
     try:
-        with MailBox(IMAP_SERVER).login(EMAIL_ADDRESS, EMAIL_PASSWORD) as mailbox:
-            logger.info("Login successful")
+        with MailBox(imap_server).login(email_address, email_password) as mailbox:
+            logger.info("Login successful for %s", email_address)
             since_date = date.today() - timedelta(days=7)
             logger.debug("Fetching UNSEEN emails since %s...", since_date)
 
@@ -267,8 +292,8 @@ def check_emails() -> None:
     except MailboxLoginError as e:
         logger.error(
             "IMAP login failed for %s on %s — %s",
-            EMAIL_ADDRESS,
-            IMAP_SERVER,
+            email_address,
+            imap_server,
             e,
         )
         logger.error(
@@ -279,14 +304,14 @@ def check_emails() -> None:
     except ConnectionRefusedError:
         logger.error(
             "Connection refused by %s — is the IMAP server address correct?",
-            IMAP_SERVER,
+            imap_server,
         )
     except TimeoutError:
         logger.error(
-            "Connection to %s timed out — check your network or firewall", IMAP_SERVER
+            "Connection to %s timed out — check your network or firewall", imap_server
         )
     except OSError as e:
-        logger.error("Network error connecting to %s: %s", IMAP_SERVER, e)
+        logger.error("Network error connecting to %s: %s", imap_server, e)
     except Exception as e:
         logger.error("Unexpected error: %s: %s", type(e).__name__, e, exc_info=True)
 
@@ -296,11 +321,13 @@ def main() -> None:
     logger.info("=" * 50)
     logger.info("  Email Payment Monitor")
     logger.info("=" * 50)
-    logger.info("  IMAP Server  : %s", IMAP_SERVER)
-    logger.info("  Email        : %s", EMAIL_ADDRESS)
-    logger.info("  Poll Interval: %ds", POLL_INTERVAL)
-    logger.info("  Dry Run      : %s", DRY_RUN)
-    logger.info("  Discord      : %s", "SET" if DISCORD_WEBHOOK else "NOT SET")
+    accounts = get_accounts()
+    logger.info("  Configured Accounts : %d", len(accounts))
+    for i, acc in enumerate(accounts, start=1):
+        logger.info("  Account %d          : %s (%s)", i, acc["email"], acc["server"])
+    logger.info("  Poll Interval       : %ds", POLL_INTERVAL)
+    logger.info("  Dry Run             : %s", DRY_RUN)
+    logger.info("  Discord             : %s", "SET" if DISCORD_WEBHOOK else "NOT SET")
     logger.info("=" * 50)
 
     if not validate_config():
@@ -310,7 +337,8 @@ def main() -> None:
     logger.info("Starting email monitor loop...")
 
     while True:
-        check_emails()
+        for account in get_accounts():
+            check_emails(account)
         logger.info("Sleeping %ds until next check...", POLL_INTERVAL)
         time.sleep(POLL_INTERVAL)
 
